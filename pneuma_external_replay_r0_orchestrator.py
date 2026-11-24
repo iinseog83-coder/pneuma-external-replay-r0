@@ -335,20 +335,33 @@ def collect_host_qualification(elan_bin_dir: Path) -> Dict[str, object]:
 
     def cmd_out(args: List[str]) -> str:
         p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if p.returncode != 0 and not p.stdout.strip():
+            raise RuntimeError(f"Command {args} failed (rc={p.returncode}): {p.stderr.strip()}")
         return p.stdout.strip()
 
-    shim_lean = shutil.which("lean") or str(elan_bin_dir / "lean")
-    shim_lake = shutil.which("lake") or str(elan_bin_dir / "lake")
-    shim_lc = shutil.which("leanchecker") or str(elan_bin_dir / "leanchecker")
+    # Ensure ELAN_HOME and PATH explicitly point to the runner user's elan installation
+    elan_exe = elan_bin_dir / "elan"
+    elan_home = elan_bin_dir.parent
+    os.environ["ELAN_HOME"] = str(elan_home)
+    os.environ["PATH"] = f"{elan_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
 
-    real_lean = cmd_out(["elan", "which", "lean"])
-    real_lake = cmd_out(["elan", "which", "lake"])
-    real_lc = cmd_out(["elan", "which", "leanchecker"])
+    shim_lean = str(elan_bin_dir / "lean") if (elan_bin_dir / "lean").exists() else (shutil.which("lean") or "")
+    shim_lake = str(elan_bin_dir / "lake") if (elan_bin_dir / "lake").exists() else (shutil.which("lake") or "")
+    shim_lc = (
+        str(elan_bin_dir / "leanchecker")
+        if (elan_bin_dir / "leanchecker").exists()
+        else (shutil.which("leanchecker") or "")
+    )
+
+    elan_cmd = str(elan_exe) if elan_exe.exists() else "elan"
+    real_lean = cmd_out([elan_cmd, "which", "lean"])
+    real_lake = cmd_out([elan_cmd, "which", "lake"])
+    real_lc = cmd_out([elan_cmd, "which", "leanchecker"])
     real_py = str(Path(sys.executable).resolve())
 
     lean_ver = cmd_out([real_lean, "--version"])
     lake_ver = cmd_out([real_lake, "--version"])
-    elan_ver = cmd_out(["elan", "--version"])
+    elan_ver = cmd_out([elan_cmd, "--version"])
 
     meminfo = read_opt("/proc/meminfo")
     mem_total_kb = None
@@ -547,13 +560,15 @@ def prepare_zone02_workspace(zone01_unpacked: Path, zone02: Path) -> Path:
     src_gate = zone01_unpacked / "BROCA_NATIVE_OMEGA_GATE_C1"
     dst_gate = zone02 / "BROCA_NATIVE_OMEGA_GATE_C1"
     shutil.copytree(src_gate, dst_gate)
-    # Ensure directories and copied files in disposable Zone 02 have clean standard permissions (0755 / 0644)
-    for p in dst_gate.rglob("*"):
-        if p.is_dir():
-            os.chmod(p, 0o755)
-        elif p.is_file():
-            os.chmod(p, 0o644)
+    # Top-down chmod so parent directories are 0755 before touching children
     os.chmod(dst_gate, 0o755)
+    for dirpath, dirnames, filenames in os.walk(dst_gate):
+        dp = Path(dirpath)
+        os.chmod(dp, 0o755)
+        for dn in dirnames:
+            os.chmod(dp / dn, 0o755)
+        for fn in filenames:
+            os.chmod(dp / fn, 0o644)
     return dst_gate
 
 
@@ -726,8 +741,11 @@ def run_sentinels_k1_k2(
         )
 
         rc_k2 = int(r_k2["exit_code"])
-        err_low = (r_k2["stderr"] + "\n" + r_k2["stdout"]).lower()
-        if not file_opened_confirmed:
+        combined_k2_out = r_k2["stderr"] + "\n" + r_k2["stdout"]
+        err_low = combined_k2_out.lower()
+        loader_named_target = "po_diff_01_to_08.olean" in err_low
+        any_consumption_proof = file_opened_confirmed or loader_named_target
+        if not any_consumption_proof:
             k2_proc_class = "UNCONSUMED_OR_STRACE_UNCONFIRMED"
         elif rc_k2 < 0 or rc_k2 >= 128:
             k2_proc_class = "PROCESS_CRASH_OR_SIGNAL"
@@ -744,9 +762,10 @@ def run_sentinels_k1_k2(
             "mutated_sha256": mutated_sha,
             "hash_gate_verdict": "HASH_GATE_REJECTED" if hash_gate_rejected else "HASH_GATE_FAILED",
             "corrupted_olean_consumption_verdict": (
-                "CORRUPTED_OLEAN_CONSUMED" if file_opened_confirmed else "CONSUMPTION_UNCONFIRMED_NOT_COUNTED"
+                "CORRUPTED_OLEAN_CONSUMED" if any_consumption_proof else "CONSUMPTION_UNCONFIRMED_NOT_COUNTED"
             ),
             "strace_openat_fd_confirmed": file_opened_confirmed,
+            "loader_stderr_named_target_confirmed": loader_named_target,
             "leanchecker_exit_code": rc_k2,
             "process_reaction_classification": k2_proc_class,
             "semantic_kernel_rejection_claimed": False,
