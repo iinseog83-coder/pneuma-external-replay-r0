@@ -44,8 +44,8 @@ env:
   WORK_SUBDIR: "pneuma_ext_replay_r0"
   EXPECTED_BUNDLE_ZIP_BYTES: "784963"
   EXPECTED_BUNDLE_ZIP_SHA256: "B0E9BB1C404E16E6E08E23D40DCD08BD3B1A831D7B796D8DC97B1D773B67CFC6"
-  EXPECTED_ORCHESTRATOR_BYTES: "48726"
-  EXPECTED_ORCHESTRATOR_SHA256: "F9CDDCC7DC7685B2625728C61E41816FC0FB5B2C0B826A557356E62B35B53EBA"
+  EXPECTED_ORCHESTRATOR_BYTES: "49738"
+  EXPECTED_ORCHESTRATOR_SHA256: "329B1195CF9EE062129D8C8B0981147DC59450F7898F3699F24301B786FF13A4"
   PINNED_LEAN_TOOLCHAIN: "leanprover/lean4:v4.33.1"
 
 jobs:
@@ -174,15 +174,19 @@ jobs:
           PROV_LOG="${ZONE03}/logs/step4_toolchain_provision.log"
           timeout --signal=TERM --kill-after=30s 600s bash -c '
             set -euo pipefail
-            sudo apt-get update -y
-            sudo apt-get install -y --no-install-recommends time strace jq unzip
+            if [[ ! -x /usr/bin/time ]] || ! command -v strace >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
+              sudo apt-get update -y
+              sudo apt-get install -y --no-install-recommends time strace jq unzip
+            fi
             curl -sSfL https://elan.lean-lang.org/elan-init.sh -o "${RUNNER_TEMP}/elan-init.sh"
             sh "${RUNNER_TEMP}/elan-init.sh" -y --no-modify-path --default-toolchain none
+            export ELAN_HOME="${HOME}/.elan"
             export PATH="${HOME}/.elan/bin:${PATH}"
             elan toolchain install "'"${PINNED_LEAN_TOOLCHAIN}"'"
             elan default "'"${PINNED_LEAN_TOOLCHAIN}"'"
             "$(elan which lean)" --version
             "$(elan which lake)" --version
+            "$(elan which leanchecker)" --help >/dev/null 2>&1 || true
           ' 2>&1 | tee "${PROV_LOG}"
           echo "${HOME}/.elan/bin" >> "${GITHUB_PATH}"
           echo "elan_bin=${HOME}/.elan/bin" >> "${GITHUB_OUTPUT}"
@@ -203,12 +207,37 @@ jobs:
           INPUT_GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set +e
-          export PATH="${ELAN_BIN}:${PATH}"
+          ORIG_HOME="${HOME}"
+          ELAN_HOME_DIR="${ORIG_HOME}/.elan"
+          PYTHON3_BIN="$(command -v python3)"
+          FULL_PATH="${ELAN_BIN}:$(dirname "${PYTHON3_BIN}"):${PATH}"
+          export HOME="${ORIG_HOME}"
+          export ELAN_HOME="${ELAN_HOME_DIR}"
+          export PATH="${FULL_PATH}"
           ORCH_CONSOLE="${ZONE03}/logs/orchestrator_console.log"
-          if sudo -n unshare --net true >/dev/null 2>&1; then
+
+          if sudo -n unshare --net sudo -u "${USER}" env "HOME=${ORIG_HOME}" "ELAN_HOME=${ELAN_HOME_DIR}" "PATH=${FULL_PATH}" "${ELAN_BIN}/elan" which lean >/dev/null 2>&1; then
             echo "Network Isolation Mode: KERNEL_NETNS_UNSHARE_OFFLINE" | tee "${ORCH_CONSOLE}"
-            sudo -n unshare --net sudo -E -u "${USER}" env "PATH=${PATH}" \
-              python3 -B "${ORCH_FILE}" \
+            sudo -n unshare --net sudo -u "${USER}" env \
+              "HOME=${ORIG_HOME}" \
+              "USER=${USER}" \
+              "ELAN_HOME=${ELAN_HOME_DIR}" \
+              "RUNNER_TEMP=${RUNNER_TEMP}" \
+              "PATH=${FULL_PATH}" \
+              "GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-}" \
+              "GITHUB_REF=${GITHUB_REF:-}" \
+              "GITHUB_SHA=${GITHUB_SHA:-}" \
+              "GITHUB_WORKFLOW_REF=${GITHUB_WORKFLOW_REF:-}" \
+              "INPUT_GITHUB_WORKFLOW_SHA=${INPUT_GITHUB_WORKFLOW_SHA:-}" \
+              "GITHUB_RUN_ID=${GITHUB_RUN_ID:-}" \
+              "GITHUB_RUN_NUMBER=${GITHUB_RUN_NUMBER:-}" \
+              "GITHUB_RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT:-}" \
+              "RUNNER_NAME=${RUNNER_NAME:-}" \
+              "RUNNER_OS=${RUNNER_OS:-}" \
+              "RUNNER_ARCH=${RUNNER_ARCH:-}" \
+              "ImageOS=${ImageOS:-}" \
+              "ImageVersion=${ImageVersion:-}" \
+              "${PYTHON3_BIN}" -B "${ORCH_FILE}" \
                 --bundle-zip "${BUNDLE_FILE}" \
                 --work-root "${WORK_ROOT}" \
                 --job-start-epoch "${JOB_START_EPOCH}" \
@@ -219,7 +248,7 @@ jobs:
             ORCH_EXIT="${PIPESTATUS[0]}"
           else
             echo "Network Isolation Mode: STANDARD_EPHEMERAL_VM_NO_NET_CALLS" | tee "${ORCH_CONSOLE}"
-            python3 -B "${ORCH_FILE}" \
+            "${PYTHON3_BIN}" -B "${ORCH_FILE}" \
               --bundle-zip "${BUNDLE_FILE}" \
               --work-root "${WORK_ROOT}" \
               --job-start-epoch "${JOB_START_EPOCH}" \
@@ -293,10 +322,14 @@ jobs:
         if: always()
         shell: bash
         env:
+          WORK_ROOT: ${{ steps.preflight.outputs.work_root }}
           PREFLIGHT_OK: ${{ steps.preflight.outputs.preflight_passed }}
           ORCH_EXIT: ${{ steps.replay.outputs.orchestrator_exit_code }}
         run: |
           set -euo pipefail
+          if [[ -n "${WORK_ROOT}" ]] && [[ -d "${WORK_ROOT}/01_ImmutableInputSnapshot" ]]; then
+            chmod -R u+w "${WORK_ROOT}/01_ImmutableInputSnapshot" || true
+          fi
           if [[ "${PREFLIGHT_OK}" != "true" ]]; then
             echo "Failing job because preflight gate did not pass."
             exit 1
