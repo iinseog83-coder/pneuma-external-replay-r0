@@ -3,24 +3,16 @@
 PNEUMA-NATIVE OMEGA — AUTH-EXTERNAL-REPLAY-R0 (Revision T2 — Tier 1 Linux x86-64)
 pneuma_external_replay_r0_orchestrator.py
 
-Deterministic, stdlib-only external cloud VM replay orchestrator implementing:
-  - Gate 0 (`G0-01..02`) : Zip byte/SHA-256 lock, pre-extraction path safety, 123/123 payload
-                           verification, 15/15 & 14/14 dossier block parity.
-  - Gate 1 (`F-EXT-T0-02`): Host hardware/OS/boot_id & unwrapped elan/lean/lake/leanchecker/python3
-                           binary SHA-256 qualification.
-  - F-EXT-T0-03          : 4-Zone physical separation:
-                             01_ImmutableInputSnapshot (chmod -R a-w, pre & post tree SHA-256)
-                             02_DisposableBuildWorkspace (isolated clean build + ENV-BRIDGE-01 .exe symlinks)
-                             03_DetachedEvidenceBundle (logs, receipts, snapshots)
-                             04_DisposableSentinelScratch (isolated K1 & K2 probes, wiped post-probe)
-  - F-EXT-T2-02          : Additive execution budget allocation (sum T_i + T_evidence = 195m < 210m)
-                           with dynamic remaining-budget guard before every phase/command.
-  - Gate 2 (`G2-01..04`) : Sequential 7-layer clean `lake build`, strict `#print axioms` whitelist
-                           audit (91/91 theorems), all 7 runners + 6 Python harnesses, and sequential
-                           single-process `lake env leanchecker --fresh` across all 7 roots.
-  - F-EXT-T0-04 / T2-03  : Sentinel K1 (3-class forbidden axiom rejection: custom axiom, sorryAx,
-                           native_decide) and Sentinel K2 (separated HASH_GATE_REJECTED vs strace-verified
-                           CORRUPTED_OLEAN_CONSUMED without overclaiming semantic kernel rejection).
+Supports two-stage checkpointed execution within one isolated runner job so that
+even if a memory-constrained VM (e.g., 8 GB Private Runner) terminates during L7
+monolithic `leanchecker --fresh`, Stage 1 checkpoint evidence is already sealed
+and uploaded (`F-EXT-T1-03` & `F-EXT-T2-02`):
+  - `--phase stage1` : Gate 0 + Gate 1 + 7-layer clean `lake build` + 91/91 `#print axioms`
+                       + 7 runners + 6 Python harnesses + L1..L6 `leanchecker --fresh`
+                       + L7 incremental `leanchecker P3CDiffTribunalAudit`.
+  - `--phase stage2` : L7 monolithic `leanchecker --fresh P3CDiffTribunalAudit` +
+                       Zone 01/02 post-immutability audit + Zone 04 Sentinels K1 & K2 +
+                       final receipt emission.
 """
 
 from __future__ import annotations
@@ -50,9 +42,9 @@ PINNED_LEAN_COMMIT = "819816b2e0a3bf405af45ae5c7af2491d8f5bee6"
 ALLOWED_LEAN_AXIOMS = {"propext", "Classical.choice", "Quot.sound"}
 
 # Additive budget allocation (`F-EXT-T2-02`: 10 + 45 + 15 + 95 + 10 + 20 = 195 min < 210 min job limit)
-JOB_TOTAL_BUDGET_SEC = 210 * 60       # 12,600s (210m)
-EVIDENCE_RESERVE_SEC = 20 * 60        # 1,200s  (20m reserved strictly for sealing & upload)
-MIN_STEP_HEADROOM_SEC = 120           # 2m minimum step margin
+JOB_TOTAL_BUDGET_SEC = 210 * 60
+EVIDENCE_RESERVE_SEC = 20 * 60
+MIN_STEP_HEADROOM_SEC = 120
 PHASE_BUDGETS_SEC = {
     "provision_and_preflight": 10 * 60,
     "clean_build_7_layers": 45 * 60,
@@ -61,7 +53,6 @@ PHASE_BUDGETS_SEC = {
     "sentinel_probes_k1_k2": 10 * 60,
 }
 
-# 7-layer canonical DAG specification (exact relative paths under BROCA_NATIVE_OMEGA_GATE_C1)
 LAYERS = [
     {
         "layer_id": "L1_P1_ExactRat",
@@ -252,22 +243,24 @@ def run_timed_cmd(
     cwd: Path,
     log_path: Path,
     timeout_sec: int,
-    env_override: Optional[Dict[str, str]] = None,
+    high_oom_score_child: bool = False,
 ) -> Dict[str, object]:
     env = dict(os.environ)
     env["LC_ALL"] = "C.UTF-8"
     env["TZ"] = "UTC"
     env["PYTHONHASHSEED"] = "0"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    if env_override:
-        env.update(env_override)
 
     gnu_time = Path("/usr/bin/time")
+    choom_bin = shutil.which("choom")
     time_file = log_path.with_suffix(log_path.suffix + ".timev")
+
+    wrapped_cmd = list(cmd)
+    if high_oom_score_child and choom_bin:
+        # Ensure child process is targeted BEFORE Runner.Worker if kernel OOM triggers
+        wrapped_cmd = [choom_bin, "-n", "800", "--", *wrapped_cmd]
     if gnu_time.exists():
-        wrapped_cmd = [str(gnu_time), "-v", "-o", str(time_file), *cmd]
-    else:
-        wrapped_cmd = list(cmd)
+        wrapped_cmd = [str(gnu_time), "-v", "-o", str(time_file), *wrapped_cmd]
 
     t0 = time.perf_counter()
     timed_out = False
@@ -312,7 +305,12 @@ def run_timed_cmd(
     )
     log_path.write_text(combined_log, encoding="utf-8")
 
-    oom_suspected = (rc in (137, -9)) or ("out of memory" in err_txt.lower()) or ("std::bad_alloc" in err_txt.lower())
+    oom_suspected = (
+        (rc in (137, -9))
+        or ("out of memory" in err_txt.lower())
+        or ("std::bad_alloc" in err_txt.lower())
+        or ("killed" in err_txt.lower() and rc != 0)
+    )
     return {
         "command": cmd,
         "cwd": str(cwd),
@@ -328,7 +326,15 @@ def run_timed_cmd(
     }
 
 
+def setup_elan_env(elan_bin_dir: Path) -> None:
+    elan_home = elan_bin_dir.parent
+    os.environ["ELAN_HOME"] = str(elan_home)
+    os.environ["PATH"] = f"{elan_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+
+
 def collect_host_qualification(elan_bin_dir: Path) -> Dict[str, object]:
+    setup_elan_env(elan_bin_dir)
+
     def read_opt(p: str) -> str:
         fp = Path(p)
         return fp.read_text(encoding="utf-8", errors="replace").strip() if fp.exists() else ""
@@ -339,12 +345,7 @@ def collect_host_qualification(elan_bin_dir: Path) -> Dict[str, object]:
             raise RuntimeError(f"Command {args} failed (rc={p.returncode}): {p.stderr.strip()}")
         return p.stdout.strip()
 
-    # Ensure ELAN_HOME and PATH explicitly point to the runner user's elan installation
     elan_exe = elan_bin_dir / "elan"
-    elan_home = elan_bin_dir.parent
-    os.environ["ELAN_HOME"] = str(elan_home)
-    os.environ["PATH"] = f"{elan_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
-
     shim_lean = str(elan_bin_dir / "lean") if (elan_bin_dir / "lean").exists() else (shutil.which("lean") or "")
     shim_lake = str(elan_bin_dir / "lake") if (elan_bin_dir / "lake").exists() else (shutil.which("lake") or "")
     shim_lc = (
@@ -365,9 +366,13 @@ def collect_host_qualification(elan_bin_dir: Path) -> Dict[str, object]:
 
     meminfo = read_opt("/proc/meminfo")
     mem_total_kb = None
+    swap_total_kb = None
     m_mem = re.search(r"MemTotal:\s*(\d+)\s*kB", meminfo)
+    m_swp = re.search(r"SwapTotal:\s*(\d+)\s*kB", meminfo)
     if m_mem:
         mem_total_kb = int(m_mem.group(1))
+    if m_swp:
+        swap_total_kb = int(m_swp.group(1))
 
     return {
         "captured_at_utc": utc_now_iso(),
@@ -380,6 +385,9 @@ def collect_host_qualification(elan_bin_dir: Path) -> Dict[str, object]:
         "lscpu_summary": cmd_out(["lscpu"]),
         "mem_total_kb": mem_total_kb,
         "mem_total_mb": round(mem_total_kb / 1024.0, 2) if mem_total_kb else None,
+        "swap_total_kb": swap_total_kb,
+        "swap_total_mb": round(swap_total_kb / 1024.0, 2) if swap_total_kb is not None else None,
+        "extra_swap_provisioned_note": os.environ.get("PNEUMA_SWAP_PROVISION_NOTE", "NONE"),
         "github_context": {
             "repository": os.environ.get("GITHUB_REPOSITORY", ""),
             "ref": os.environ.get("GITHUB_REF", ""),
@@ -402,15 +410,15 @@ def collect_host_qualification(elan_bin_dir: Path) -> Dict[str, object]:
             "lake_version": lake_ver.splitlines()[0] if lake_ver else "",
             "python_version": sys.version.replace("\n", " "),
             "shim_lean_path": shim_lean,
-            "shim_lean_sha256": sha256_file(Path(shim_lean)) if Path(shim_lean).exists() else "",
+            "shim_lean_sha256": sha256_file(Path(shim_lean)) if shim_lean and Path(shim_lean).exists() else "",
             "resolved_lean_path": real_lean,
             "resolved_lean_sha256": sha256_file(Path(real_lean)) if Path(real_lean).exists() else "",
             "shim_lake_path": shim_lake,
-            "shim_lake_sha256": sha256_file(Path(shim_lake)) if Path(shim_lake).exists() else "",
+            "shim_lake_sha256": sha256_file(Path(shim_lake)) if shim_lake and Path(shim_lake).exists() else "",
             "resolved_lake_path": real_lake,
             "resolved_lake_sha256": sha256_file(Path(real_lake)) if Path(real_lake).exists() else "",
             "shim_leanchecker_path": shim_lc,
-            "shim_leanchecker_sha256": sha256_file(Path(shim_lc)) if Path(shim_lc).exists() else "",
+            "shim_leanchecker_sha256": sha256_file(Path(shim_lc)) if shim_lc and Path(shim_lc).exists() else "",
             "resolved_leanchecker_path": real_lc,
             "resolved_leanchecker_sha256": sha256_file(Path(real_lc)) if Path(real_lc).exists() else "",
             "resolved_python_path": real_py,
@@ -429,8 +437,7 @@ def run_gate0_admission(zip_src_path: Path, zone01: Path) -> Dict[str, object]:
 
     actual_bytes = zip_src_path.stat().st_size
     actual_sha = sha256_file(zip_src_path)
-    zip_hash_ok = (actual_bytes == EXPECTED_ZIP_BYTES) and (actual_sha == EXPECTED_ZIP_SHA256)
-    if not zip_hash_ok:
+    if (actual_bytes != EXPECTED_ZIP_BYTES) or (actual_sha != EXPECTED_ZIP_SHA256):
         return {
             "passed": False,
             "reason": "OUTER_ZIP_HASH_OR_SIZE_MISMATCH",
@@ -438,12 +445,10 @@ def run_gate0_admission(zip_src_path: Path, zone01: Path) -> Dict[str, object]:
             "actual_sha256": actual_sha,
         }
 
-    # Copy frozen zip into Zone 01 before inspecting
     zone01.mkdir(parents=True, exist_ok=True)
     snap_zip = zone01 / zip_src_path.name
     shutil.copy2(zip_src_path, snap_zip)
 
-    # Pre-extraction safety check (`G0-01`)
     with zipfile.ZipFile(snap_zip, "r") as zf:
         infos = zf.infolist()
         names = [inf.filename for inf in infos]
@@ -480,7 +485,6 @@ def run_gate0_admission(zip_src_path: Path, zone01: Path) -> Dict[str, object]:
         unpacked.mkdir(parents=True, exist_ok=True)
         zf.extractall(unpacked)
 
-    # Verify MANIFEST.sha256 (`123/123`) and separate non-manifest meta entries (`MANIFEST.json`, `MANIFEST.sha256`)
     manifest_sha_file = unpacked / "MANIFEST.sha256"
     manifest_json_file = unpacked / "MANIFEST.json"
     if not manifest_sha_file.exists() or not manifest_json_file.exists():
@@ -532,7 +536,6 @@ def run_gate0_admission(zip_src_path: Path, zone01: Path) -> Dict[str, object]:
             "prov_blocks": prov_blocks,
         }
 
-    # Lock Zone 01 read-only (`chmod -R a-w`) and record pre-execution tree digest
     lock_tree_readonly(zone01)
     pre_tree_sha, pre_tree_count = compute_tree_digest(zone01)
 
@@ -560,7 +563,6 @@ def prepare_zone02_workspace(zone01_unpacked: Path, zone02: Path) -> Path:
     src_gate = zone01_unpacked / "BROCA_NATIVE_OMEGA_GATE_C1"
     dst_gate = zone02 / "BROCA_NATIVE_OMEGA_GATE_C1"
     shutil.copytree(src_gate, dst_gate)
-    # Top-down chmod so parent directories are 0755 before touching children
     os.chmod(dst_gate, 0o755)
     for dirpath, dirnames, filenames in os.walk(dst_gate):
         dp = Path(dirpath)
@@ -621,10 +623,6 @@ def run_sentinels_k1_k2(
 
     zone04.mkdir(parents=True, exist_ok=True)
     try:
-        # -------------------------------------------------------------------
-        # Sentinel K1 (`F-EXT-T0-04`): Verify the EXACT `parse_and_verify_axioms`
-        # filter deterministically rejects (1) custom axiom, (2) sorryAx, (3) native_decide
-        # -------------------------------------------------------------------
         k1_dir = zone04 / "k1_axiom_probes"
         k1_dir.mkdir(parents=True, exist_ok=True)
         k1_cases = [
@@ -654,7 +652,9 @@ def run_sentinels_k1_k2(
                 timeout_sec=120,
             )
             audit = parse_and_verify_axioms(r["stdout"], min_expected_count=1)
-            rejected_by_axiom_filter = (audit["entry_count"] >= 1) and (not audit["passed"]) and (len(audit["forbidden_detections"]) >= 1)
+            rejected_by_axiom_filter = (
+                (audit["entry_count"] >= 1) and (not audit["passed"]) and (len(audit["forbidden_detections"]) >= 1)
+            )
             if not rejected_by_axiom_filter:
                 k1_all_rejected = False
             k1_results.append(
@@ -666,14 +666,15 @@ def run_sentinels_k1_k2(
                 }
             )
 
-        # -------------------------------------------------------------------
-        # Sentinel K2 (`F-EXT-T2-03`): Isolated corrupted `.olean` test
-        # Separates (a) HASH_GATE_REJECTED from (b) CORRUPTED_OLEAN_CONSUMED (strace-verified)
-        # -------------------------------------------------------------------
         k2_gate = zone04 / "k2_corrupt_olean_env" / "BROCA_NATIVE_OMEGA_GATE_C1"
         k2_gate.mkdir(parents=True, exist_ok=True)
-        # Symlink untouched upstream sibling packages read-only; copy ONLY P3C_Differential_R1
-        for sib in ("P2_DerivationReplay", "P3_LexicalGrammar", "P3B_BoundedParser", "P3C_SemanticNorm", "P3C_Provenance_R1"):
+        for sib in (
+            "P2_DerivationReplay",
+            "P3_LexicalGrammar",
+            "P3B_BoundedParser",
+            "P3C_SemanticNorm",
+            "P3C_Provenance_R1",
+        ):
             os.symlink(zone02_gate / sib, k2_gate / sib, target_is_directory=True)
         k2_diff = k2_gate / "P3C_Differential_R1"
         shutil.copytree(zone02_gate / "P3C_Differential_R1", k2_diff, symlinks=True)
@@ -683,22 +684,17 @@ def run_sentinels_k1_k2(
         )
         orig_bytes = target_olean.read_bytes()
         orig_sha = sha256_bytes(orig_bytes)
-        # Corrupt the 5-byte magic header ("olean" -> "Xlean") in disposable Zone 04 ONLY
         mutated_bytes = b"X" + orig_bytes[1:]
         target_olean.write_bytes(mutated_bytes)
         mutated_sha = sha256_file(target_olean)
-        hash_gate_rejected = (orig_sha != mutated_sha)
+        hash_gate_rejected = orig_sha != mutated_sha
 
         strace_bin = shutil.which("strace")
         strace_dir = zone04 / "k2_strace_traces"
         strace_dir.mkdir(parents=True, exist_ok=True)
         strace_usable = False
         if strace_bin:
-            probe_st = subprocess.run(
-                [strace_bin, "-e", "trace=openat", "/bin/true"],
-                capture_output=True,
-                text=True,
-            )
+            probe_st = subprocess.run([strace_bin, "-e", "trace=openat", "/bin/true"], capture_output=True, text=True)
             strace_usable = probe_st.returncode == 0
 
         if strace_bin and strace_usable:
@@ -783,22 +779,11 @@ def run_sentinels_k1_k2(
         shutil.rmtree(zone04, ignore_errors=True)
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--bundle-zip", required=True)
-    ap.add_argument("--work-root", required=True)
-    ap.add_argument("--job-start-epoch", type=float, required=True)
-    ap.add_argument("--expected-workflow-sha256", required=True)
-    ap.add_argument("--executed-workflow-sha256", required=True)
-    ap.add_argument("--executed-workflow-bytes", type=int, required=True)
-    ap.add_argument("--elan-bin-dir", required=True)
-    args = ap.parse_args()
-
+def run_stage1(args: argparse.Namespace) -> int:
     work_root = Path(args.work_root).resolve()
     zone01 = work_root / "01_ImmutableInputSnapshot"
     zone02 = work_root / "02_DisposableBuildWorkspace"
     zone03 = work_root / "03_DetachedEvidenceBundle"
-    zone04 = work_root / "04_DisposableSentinelScratch"
     logs_dir = zone03 / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -835,7 +820,6 @@ def main() -> int:
         (zone03 / "PNEUMA_EXTERNAL_REPLAY_R0_RECEIPT.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         return 2
 
-    # Gate 1: Host & Toolchain Qualification
     host_qual = collect_host_qualification(Path(args.elan_bin_dir))
     receipt["gate1_host_qualification"] = host_qual
     (zone03 / "host_qualification_receipt.json").write_text(json.dumps(host_qual, indent=2) + "\n", encoding="utf-8")
@@ -851,7 +835,6 @@ def main() -> int:
         (zone03 / "PNEUMA_EXTERNAL_REPLAY_R0_RECEIPT.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         return 3
 
-    # Gate 0: Canonical Input Admission & Zone 01 Read-Only Snapshot
     g0 = run_gate0_admission(Path(args.bundle_zip).resolve(), zone01)
     receipt["gate0_input_admission"] = g0
     if not g0.get("passed", False):
@@ -865,7 +848,6 @@ def main() -> int:
         (zone03 / "PNEUMA_EXTERNAL_REPLAY_R0_RECEIPT.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         return 4
 
-    # Prepare Zone 02 Disposable Build Workspace
     zone01_unpacked = zone01 / "UnpackedFrozenSnapshot"
     zone02_gate = prepare_zone02_workspace(zone01_unpacked, zone02)
 
@@ -878,7 +860,7 @@ def main() -> int:
     hold_reason: Optional[str] = None
     counterexample_found = False
 
-    # Phase A: Sequential 7-Layer Clean `lake build` + `#print axioms` + `ENV-BRIDGE-01` POSIX `.exe` Alias
+    # Phase A: 7-layer clean `lake build` + `#print axioms` + `ENV-BRIDGE-01`
     for spec in LAYERS:
         lid = spec["layer_id"]
         pkg_dir = zone02_gate if spec["rel_dir"] == "." else (zone02_gate / spec["rel_dir"])
@@ -902,7 +884,6 @@ def main() -> int:
             hold_reason = f"CLEAN_BUILD_FAILED:{lid}"
             break
 
-        # Strict `#print axioms` check via `lake env lean <AuditFile>`
         ax_res = run_timed_cmd(
             ["lake", "env", "lean", spec["audit_lean"]],
             cwd=pkg_dir,
@@ -948,7 +929,7 @@ def main() -> int:
             counterexample_found = True
             break
 
-    # Phase B: Execute All 7 Compiled Runners + 6 Python Differential/Provenance Harnesses
+    # Phase B: All 7 Runners + 6 Python Harnesses
     if hold_reason is None:
         for spec in LAYERS:
             lid = spec["layer_id"]
@@ -998,14 +979,13 @@ def main() -> int:
 
             layer_suite_records.append(rec_item)
 
-    # Phase C: Sequential Single-Process `lake env leanchecker --fresh <Root>` Across All 7 Layers
+    # Phase C1: L1..L6 `leanchecker --fresh` + L7 module-level `leanchecker` before checkpoint upload
+    l7_incremental_record: Optional[Dict[str, object]] = None
     if hold_reason is None:
-        for spec in LAYERS:
+        for spec in LAYERS[:-1]:
             lid = spec["layer_id"]
             pkg_dir = zone02_gate if spec["rel_dir"] == "." else (zone02_gate / spec["rel_dir"])
-            # Require at least 300s (or 900s before L7 Differential R1) before reserve
-            min_req = 900 if lid == "L7_P3C_Differential_R1" else 240
-            ok_f, rem_f = budget.check_can_start(min_req)
+            ok_f, rem_f = budget.check_can_start(240)
             if not ok_f:
                 hold_reason = f"RESOURCE_LIMIT_BEFORE_FRESH_LEANCHECKER:{lid}"
                 break
@@ -1015,6 +995,7 @@ def main() -> int:
                 cwd=pkg_dir,
                 log_path=logs_dir / f"{lid}_leanchecker_fresh.log",
                 timeout_sec=min(PHASE_BUDGETS_SEC["fresh_leanchecker_7_layers"], int(rem_f)),
+                high_oom_score_child=True,
             )
             layer_fresh_records.append(
                 {
@@ -1035,7 +1016,108 @@ def main() -> int:
                 counterexample_found = True
                 break
 
-    # Post-execution immutability checks on Zone 01 AND Zone 02 BEFORE running Zone 04 Sentinels!
+    if hold_reason is None:
+        l7_dir = zone02_gate / "P3C_Differential_R1"
+        r_inc = run_timed_cmd(
+            ["lake", "env", "leanchecker", "P3CDiffTribunalAudit"],
+            cwd=l7_dir,
+            log_path=logs_dir / "L7_P3C_Differential_R1_leanchecker_incremental.log",
+            timeout_sec=min(1200, int(budget.remaining_before_reserve_sec())),
+            high_oom_score_child=True,
+        )
+        l7_incremental_record = {
+            "layer_id": "L7_P3C_Differential_R1",
+            "mode": "INCREMENTAL_ALL_PACKAGE_MODULES_ON_FRESH_PROVENANCE_R1_BASE",
+            "exit_code": r_inc["exit_code"],
+            "timed_out": r_inc["timed_out"],
+            "oom_suspected": r_inc["oom_suspected"],
+            "elapsed_sec": r_inc["elapsed_sec"],
+            "max_rss_mb": r_inc["max_rss_mb"],
+        }
+        if r_inc["exit_code"] != 0:
+            hold_reason = "INCREMENTAL_LEANCHECKER_L7_FAILED"
+            counterexample_found = not (r_inc["timed_out"] or r_inc["oom_suspected"])
+
+    receipt["gate2_clean_build_and_axioms"] = layer_build_records
+    receipt["env_bridge_01_posix_aliases"] = env_bridge_aliases
+    receipt["gate2_runners_and_oracles"] = layer_suite_records
+    receipt["gate2_fresh_leanchecker"] = layer_fresh_records
+    receipt["gate2_l7_incremental_leanchecker"] = l7_incremental_record
+    receipt["compiled_new_binary_sha256_gauge_record"] = compiled_new_binary_hashes
+    receipt["stage1_checkpoint_status"] = {
+        "completed_at_utc": utc_now_iso(),
+        "stage1_passed": hold_reason is None,
+        "hold_reason": hold_reason,
+        "counterexample_found": counterexample_found,
+        "elapsed_sec": round(budget.elapsed_sec(), 4),
+    }
+    receipt["three_axis_verdicts"] = {
+        "host_independence_verdict": "INDEPENDENT_HOST_CONFIRMED",
+        "evidence_collection_verdict": "STAGE1_CHECKPOINT_COLLECTED",
+        "replay_verification_verdict": "COUNTEREXAMPLE_FOUND" if counterexample_found else "REPRODUCTION_HELD",
+        "hold_or_failure_reason": hold_reason or "STAGE1_PASSED_AWAITING_STAGE2_L7_MONOLITHIC_FRESH",
+    }
+
+    (zone03 / "PNEUMA_EXTERNAL_REPLAY_R0_RECEIPT.json").write_text(
+        json.dumps(receipt, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return 0 if hold_reason is None else 1
+
+
+def run_stage2(args: argparse.Namespace) -> int:
+    setup_elan_env(Path(args.elan_bin_dir))
+    work_root = Path(args.work_root).resolve()
+    zone01 = work_root / "01_ImmutableInputSnapshot"
+    zone02 = work_root / "02_DisposableBuildWorkspace"
+    zone03 = work_root / "03_DetachedEvidenceBundle"
+    zone04 = work_root / "04_DisposableSentinelScratch"
+    logs_dir = zone03 / "logs"
+
+    rec_path = zone03 / "PNEUMA_EXTERNAL_REPLAY_R0_RECEIPT.json"
+    receipt = json.loads(rec_path.read_text(encoding="utf-8"))
+    budget = BudgetTracker(args.job_start_epoch)
+
+    s1 = receipt.get("stage1_checkpoint_status", {})
+    hold_reason: Optional[str] = s1.get("hold_reason")
+    counterexample_found: bool = bool(s1.get("counterexample_found", False))
+    layer_fresh_records: List[Dict[str, object]] = list(receipt.get("gate2_fresh_leanchecker", []))
+
+    zone01_unpacked = zone01 / "UnpackedFrozenSnapshot"
+    zone02_gate = zone02 / "BROCA_NATIVE_OMEGA_GATE_C1"
+
+    # Execute L7 monolithic `lake env leanchecker --fresh P3CDiffTribunalAudit`
+    if hold_reason is None:
+        ok_f, rem_f = budget.check_can_start(900)
+        if not ok_f:
+            hold_reason = "RESOURCE_LIMIT_BEFORE_FRESH_LEANCHECKER:L7_P3C_Differential_R1"
+        else:
+            l7_dir = zone02_gate / "P3C_Differential_R1"
+            r_lc = run_timed_cmd(
+                ["lake", "env", "leanchecker", "--fresh", "P3CDiffTribunalAudit"],
+                cwd=l7_dir,
+                log_path=logs_dir / "L7_P3C_Differential_R1_leanchecker_fresh.log",
+                timeout_sec=min(PHASE_BUDGETS_SEC["fresh_leanchecker_7_layers"], int(rem_f)),
+                high_oom_score_child=True,
+            )
+            layer_fresh_records.append(
+                {
+                    "layer_id": "L7_P3C_Differential_R1",
+                    "fresh_root": "P3CDiffTribunalAudit",
+                    "exit_code": r_lc["exit_code"],
+                    "timed_out": r_lc["timed_out"],
+                    "oom_suspected": r_lc["oom_suspected"],
+                    "elapsed_sec": r_lc["elapsed_sec"],
+                    "max_rss_mb": r_lc["max_rss_mb"],
+                }
+            )
+            if r_lc["timed_out"] or r_lc["oom_suspected"]:
+                hold_reason = "RESOURCE_LIMIT_DURING_FRESH_LEANCHECKER:L7_P3C_Differential_R1"
+            elif r_lc["exit_code"] != 0:
+                hold_reason = "FRESH_LEANCHECKER_FAILED:L7_P3C_Differential_R1"
+                counterexample_found = True
+
+    g0 = receipt["gate0_input_admission"]
     post_z01_sha, post_z01_cnt = compute_tree_digest(zone01)
     z01_immutable_ok = (post_z01_sha == g0["zone01_pre_tree_sha256"]) and (
         post_z01_cnt == g0["zone01_pre_tree_entry_count"]
@@ -1046,7 +1128,6 @@ def main() -> int:
         if hold_reason is None:
             hold_reason = "POST_EXECUTION_SOURCE_IMMUTABILITY_VIOLATION"
 
-    # Phase D: Isolated Zone 04 Sentinels (K1 & K2)
     sentinel_report = run_sentinels_k1_k2(zone02_gate, zone04, logs_dir, budget)
     if sentinel_report.get("status") == "COMPLETED":
         if not sentinel_report["k1_axiom_contamination_sentinel"]["passed"]:
@@ -1056,14 +1137,13 @@ def main() -> int:
             if hold_reason is None:
                 hold_reason = "SENTINEL_K2_HASH_GATE_FAILED"
 
-    # Re-confirm Zone 01 remained 100% untouched even after Zone 04 sentinels
     final_z01_sha, _ = compute_tree_digest(zone01)
     z01_immutable_after_sentinels = final_z01_sha == g0["zone01_pre_tree_sha256"]
 
     all_clean_passed = (
         hold_reason is None
-        and len(layer_build_records) == len(LAYERS)
-        and len(layer_suite_records) == len(LAYERS)
+        and len(receipt.get("gate2_clean_build_and_axioms", [])) == len(LAYERS)
+        and len(receipt.get("gate2_runners_and_oracles", [])) == len(LAYERS)
         and len(layer_fresh_records) == len(LAYERS)
         and z01_immutable_ok
         and z01_immutable_after_sentinels
@@ -1077,11 +1157,7 @@ def main() -> int:
     else:
         replay_verdict = "REPRODUCTION_HELD"
 
-    receipt["gate2_clean_build_and_axioms"] = layer_build_records
-    receipt["env_bridge_01_posix_aliases"] = env_bridge_aliases
-    receipt["gate2_runners_and_oracles"] = layer_suite_records
     receipt["gate2_fresh_leanchecker"] = layer_fresh_records
-    receipt["compiled_new_binary_sha256_gauge_record"] = compiled_new_binary_hashes
     receipt["post_run_immutability"] = {
         "zone01_snapshot_tree_sha256_post": final_z01_sha,
         "zone01_snapshot_unchanged": z01_immutable_ok and z01_immutable_after_sentinels,
@@ -1098,7 +1174,7 @@ def main() -> int:
         ),
         "runtime_and_wire_outcomes": (
             "RUNTIME_VECTORS_REPRODUCED"
-            if (len(layer_suite_records) == len(LAYERS) and hold_reason is None)
+            if (len(receipt.get("gate2_runners_and_oracles", [])) == len(LAYERS) and s1.get("stage1_passed"))
             else "HELD_OR_FAILED"
         ),
     }
@@ -1130,11 +1206,25 @@ def main() -> int:
     receipt["total_elapsed_sec"] = round(budget.elapsed_sec(), 4)
     receipt["finished_at_utc"] = utc_now_iso()
 
-    (zone03 / "PNEUMA_EXTERNAL_REPLAY_R0_RECEIPT.json").write_text(
-        json.dumps(receipt, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    rec_path.write_text(json.dumps(receipt, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return 0 if all_clean_passed else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--phase", choices=["stage1", "stage2"], required=True)
+    ap.add_argument("--bundle-zip", required=True)
+    ap.add_argument("--work-root", required=True)
+    ap.add_argument("--job-start-epoch", type=float, required=True)
+    ap.add_argument("--expected-workflow-sha256", required=True)
+    ap.add_argument("--executed-workflow-sha256", required=True)
+    ap.add_argument("--executed-workflow-bytes", type=int, required=True)
+    ap.add_argument("--elan-bin-dir", required=True)
+    args = ap.parse_args()
+
+    if args.phase == "stage1":
+        return run_stage1(args)
+    return run_stage2(args)
 
 
 if __name__ == "__main__":
