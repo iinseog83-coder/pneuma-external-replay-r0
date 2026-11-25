@@ -1,6 +1,6 @@
 # ==============================================================================
 # PNEUMA-NATIVE OMEGA — AUTH-EXTERNAL-REPLAY-R0 (Revision T2 — Tier 1 Linux x86-64)
-# Destination in Dedicated Private GitHub Repository (Default Branch):
+# Destination in Dedicated GitHub Repository (Default Branch):
 #   .github/workflows/pneuma_external_replay_r0.yml
 #
 # Governance & Security Controls (Corrigendum T0 + T1 + T2):
@@ -12,9 +12,9 @@
 #     and is verified BEFORE unpacking or building anything (F-EXT-T2-01).
 #   - Canonical raw Git blob ZIP transport check (784,963 bytes, non-LFS, SHA-256
 #     B0E9BB1C404E16E6E08E23D40DCD08BD3B1A831D7B796D8DC97B1D773B67CFC6) (F-EXT-T1-02).
-#   - Additive budget allocation (sum T_i + T_evidence = 195m < T_job = 210m) with
-#     `if: always()` failure evidence preservation (F-EXT-T1-03 & F-EXT-T2-02).
-#   - 4-Zone physical isolation & isolated K1/K2 sentinels (F-EXT-T0-03 & F-EXT-T2-03).
+#   - Two-Stage Checkpointed Artifact Upload + 8 GB VM Swap/systemd-oomd Hardening
+#     so Runner.Worker is protected against exit-143 eviction during L7 monolithic
+#     `leanchecker --fresh` (~10.74 GB RSS) (F-EXT-T1-03 & F-EXT-T2-02).
 # ==============================================================================
 
 name: "PNEUMA External Replay R0 (Tier 1 Ubuntu 24.04 x86-64)"
@@ -44,8 +44,8 @@ env:
   WORK_SUBDIR: "pneuma_ext_replay_r0"
   EXPECTED_BUNDLE_ZIP_BYTES: "784963"
   EXPECTED_BUNDLE_ZIP_SHA256: "B0E9BB1C404E16E6E08E23D40DCD08BD3B1A831D7B796D8DC97B1D773B67CFC6"
-  EXPECTED_ORCHESTRATOR_BYTES: "49738"
-  EXPECTED_ORCHESTRATOR_SHA256: "329B1195CF9EE062129D8C8B0981147DC59450F7898F3699F24301B786FF13A4"
+  EXPECTED_ORCHESTRATOR_BYTES: "52259"
+  EXPECTED_ORCHESTRATOR_SHA256: "42AAFE8F51812AF9FB4DB5C8A607DAC5490B2B231962B73A9473CF7794B971A6"
   PINNED_LEAN_TOOLCHAIN: "leanprover/lean4:v4.33.1"
 
 jobs:
@@ -124,7 +124,7 @@ jobs:
 
           if [[ "${EXEC_WF_SHA}" != "${CLEAN_EXP_WF_SHA}" ]]; then
             echo "CRITICAL FAIL (F-EXT-T2-01): WORKFLOW_IDENTITY_MISMATCH before build!" | tee -a "${PREFLIGHT_LOG}"
-            python3 -c 'import json, os, sys; p=sys.argv[1]; json.dump({"schema":"PNEUMA_NATIVE_OMEGA_EXTERNAL_REPLAY_R0_RECEIPT_V1","three_axis_verdicts":{"host_independence_verdict":"INDEPENDENT_HOST_CONFIRMED","evidence_collection_verdict":"FAILURE_EVIDENCE_COLLECTED","replay_verification_verdict":"REPRODUCTION_HELD","hold_or_failure_reason":"WORKFLOW_IDENTITY_MISMATCH"},"expected_workflow_sha256":sys.argv[2],"executed_workflow_sha256":sys.argv[3]}, open(p,"w"), indent=2)' "${ZONE03}/PNEUMA_EXTERNAL_REPLAY_R0_RECEIPT.json" "${CLEAN_EXP_WF_SHA}" "${EXEC_WF_SHA}"
+            python3 -c 'import json, sys; p=sys.argv[1]; json.dump({"schema":"PNEUMA_NATIVE_OMEGA_EXTERNAL_REPLAY_R0_RECEIPT_V1","three_axis_verdicts":{"host_independence_verdict":"INDEPENDENT_HOST_CONFIRMED","evidence_collection_verdict":"FAILURE_EVIDENCE_COLLECTED","replay_verification_verdict":"REPRODUCTION_HELD","hold_or_failure_reason":"WORKFLOW_IDENTITY_MISMATCH"},"expected_workflow_sha256":sys.argv[2],"executed_workflow_sha256":sys.argv[3]}, open(p,"w"), indent=2)' "${ZONE03}/PNEUMA_EXTERNAL_REPLAY_R0_RECEIPT.json" "${CLEAN_EXP_WF_SHA}" "${EXEC_WF_SHA}"
             exit 1
           fi
 
@@ -164,7 +164,7 @@ jobs:
           echo "orch_file=${ORCH_FILE}" >> "${GITHUB_OUTPUT}"
           echo "preflight_passed=true" >> "${GITHUB_OUTPUT}"
 
-      - name: "4. Provision OS Observation Tools (time, strace, jq) & Pin Lean 4.33.1 via elan"
+      - name: "4. Harden VM Memory Headroom (Disable systemd-oomd + Swap Guard) & Pin Lean 4.33.1"
         id: provision
         shell: bash
         env:
@@ -172,11 +172,36 @@ jobs:
         run: |
           set -euo pipefail
           PROV_LOG="${ZONE03}/logs/step4_toolchain_provision.log"
+          SWAP_NOTE="NATIVE_16GB_VM_NO_EXTRA_SWAP_NEEDED"
+          MEM_TOTAL_KB="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
+          echo "Initial VM Memory Status:" | tee "${PROV_LOG}"
+          free -m | tee -a "${PROV_LOG}"
+
+          # Prevent Ubuntu 24.04 systemd-oomd from SIGTERM-killing Runner.Worker (exit 143) under swap pressure
+          sudo systemctl stop systemd-oomd.socket systemd-oomd.service >/dev/null 2>&1 || true
+          sudo systemctl mask systemd-oomd.socket systemd-oomd.service >/dev/null 2>&1 || true
+
+          # On 8 GB Private Repo VMs (MemTotal < 14 GiB), provision +10 GB NVMe swapfile for L7 10.74 GB peak
+          if [[ "${MEM_TOTAL_KB}" -lt 14000000 ]]; then
+            SWAP_TARGET="/mnt/pneuma_ext_swap_10g"
+            if [[ ! -d "/mnt" ]] || [[ "$(df -Pk /mnt | awk 'NR==2 {print $4}')" -lt 12000000 ]]; then
+              SWAP_TARGET="/tmp/pneuma_ext_swap_10g"
+            fi
+            sudo fallocate -l 10G "${SWAP_TARGET}"
+            sudo chmod 600 "${SWAP_TARGET}"
+            sudo mkswap "${SWAP_TARGET}"
+            sudo swapon "${SWAP_TARGET}"
+            sudo sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
+            SWAP_NOTE="PROVISIONED_10GB_SWAP_AT_${SWAP_TARGET}_AND_MASKED_SYSTEMD_OOMD_ON_8GB_PRIVATE_VM"
+            echo "Post-Swap VM Memory Status:" | tee -a "${PROV_LOG}"
+            free -m | tee -a "${PROV_LOG}"
+          fi
+
           timeout --signal=TERM --kill-after=30s 600s bash -c '
             set -euo pipefail
             if [[ ! -x /usr/bin/time ]] || ! command -v strace >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
               sudo apt-get update -y
-              sudo apt-get install -y --no-install-recommends time strace jq unzip
+              sudo apt-get install -y --no-install-recommends time strace jq unzip util-linux
             fi
             curl -sSfL https://elan.lean-lang.org/elan-init.sh -o "${RUNNER_TEMP}/elan-init.sh"
             sh "${RUNNER_TEMP}/elan-init.sh" -y --no-modify-path --default-toolchain none
@@ -186,13 +211,102 @@ jobs:
             elan default "'"${PINNED_LEAN_TOOLCHAIN}"'"
             "$(elan which lean)" --version
             "$(elan which lake)" --version
-            "$(elan which leanchecker)" --help >/dev/null 2>&1 || true
-          ' 2>&1 | tee "${PROV_LOG}"
+          ' 2>&1 | tee -a "${PROV_LOG}"
           echo "${HOME}/.elan/bin" >> "${GITHUB_PATH}"
           echo "elan_bin=${HOME}/.elan/bin" >> "${GITHUB_OUTPUT}"
+          echo "swap_note=${SWAP_NOTE}" >> "${GITHUB_OUTPUT}"
 
-      - name: "5. Run 4-Zone Clean Rebuild, 7-Layer Fresh Leanchecker, Suites & Isolated Sentinels"
-        id: replay
+      - name: "5A. Stage 1 — Clean Build (7/7), Axioms (91/91), Suites, L1..L6 Fresh & L7 Module Leanchecker"
+        id: stage1
+        shell: bash
+        env:
+          WORK_ROOT: ${{ steps.preflight.outputs.work_root }}
+          ZONE03: ${{ steps.preflight.outputs.zone03 }}
+          BUNDLE_FILE: ${{ steps.preflight.outputs.bundle_file }}
+          ORCH_FILE: ${{ steps.preflight.outputs.orch_file }}
+          JOB_START_EPOCH: ${{ steps.preflight.outputs.job_start_epoch }}
+          CLEAN_EXP_WF_SHA: ${{ steps.preflight.outputs.clean_exp_wf_sha }}
+          EXEC_WF_SHA: ${{ steps.preflight.outputs.exec_wf_sha }}
+          EXEC_WF_BYTES: ${{ steps.preflight.outputs.exec_wf_bytes }}
+          ELAN_BIN: ${{ steps.provision.outputs.elan_bin }}
+          PNEUMA_SWAP_PROVISION_NOTE: ${{ steps.provision.outputs.swap_note }}
+          INPUT_GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set +e
+          ORIG_HOME="${HOME}"
+          ELAN_HOME_DIR="${ORIG_HOME}/.elan"
+          PYTHON3_BIN="$(command -v python3)"
+          FULL_PATH="${ELAN_BIN}:$(dirname "${PYTHON3_BIN}"):${PATH}"
+          export HOME="${ORIG_HOME}"
+          export ELAN_HOME="${ELAN_HOME_DIR}"
+          export PATH="${FULL_PATH}"
+          S1_LOG="${ZONE03}/logs/stage1_console.log"
+
+          if sudo -n unshare --net sudo -u "${USER}" env "HOME=${ORIG_HOME}" "ELAN_HOME=${ELAN_HOME_DIR}" "PATH=${FULL_PATH}" "${ELAN_BIN}/elan" which lean >/dev/null 2>&1; then
+            echo "Network Isolation Mode (Stage 1): KERNEL_NETNS_UNSHARE_OFFLINE" | tee "${S1_LOG}"
+            sudo -n unshare --net sudo -u "${USER}" env \
+              "HOME=${ORIG_HOME}" \
+              "USER=${USER}" \
+              "ELAN_HOME=${ELAN_HOME_DIR}" \
+              "RUNNER_TEMP=${RUNNER_TEMP}" \
+              "PATH=${FULL_PATH}" \
+              "PNEUMA_SWAP_PROVISION_NOTE=${PNEUMA_SWAP_PROVISION_NOTE}" \
+              "GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-}" \
+              "GITHUB_REF=${GITHUB_REF:-}" \
+              "GITHUB_SHA=${GITHUB_SHA:-}" \
+              "GITHUB_WORKFLOW_REF=${GITHUB_WORKFLOW_REF:-}" \
+              "INPUT_GITHUB_WORKFLOW_SHA=${INPUT_GITHUB_WORKFLOW_SHA:-}" \
+              "GITHUB_RUN_ID=${GITHUB_RUN_ID:-}" \
+              "GITHUB_RUN_NUMBER=${GITHUB_RUN_NUMBER:-}" \
+              "GITHUB_RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT:-}" \
+              "RUNNER_NAME=${RUNNER_NAME:-}" \
+              "RUNNER_OS=${RUNNER_OS:-}" \
+              "RUNNER_ARCH=${RUNNER_ARCH:-}" \
+              "ImageOS=${ImageOS:-}" \
+              "ImageVersion=${ImageVersion:-}" \
+              "${PYTHON3_BIN}" -B "${ORCH_FILE}" \
+                --phase stage1 \
+                --bundle-zip "${BUNDLE_FILE}" \
+                --work-root "${WORK_ROOT}" \
+                --job-start-epoch "${JOB_START_EPOCH}" \
+                --expected-workflow-sha256 "${CLEAN_EXP_WF_SHA}" \
+                --executed-workflow-sha256 "${EXEC_WF_SHA}" \
+                --executed-workflow-bytes "${EXEC_WF_BYTES}" \
+                --elan-bin-dir "${ELAN_BIN}" 2>&1 | tee -a "${S1_LOG}"
+            S1_EXIT="${PIPESTATUS[0]}"
+          else
+            echo "Network Isolation Mode (Stage 1): STANDARD_EPHEMERAL_VM_NO_NET_CALLS" | tee "${S1_LOG}"
+            "${PYTHON3_BIN}" -B "${ORCH_FILE}" \
+              --phase stage1 \
+              --bundle-zip "${BUNDLE_FILE}" \
+              --work-root "${WORK_ROOT}" \
+              --job-start-epoch "${JOB_START_EPOCH}" \
+              --expected-workflow-sha256 "${CLEAN_EXP_WF_SHA}" \
+              --executed-workflow-sha256 "${EXEC_WF_SHA}" \
+              --executed-workflow-bytes "${EXEC_WF_BYTES}" \
+              --elan-bin-dir "${ELAN_BIN}" 2>&1 | tee -a "${S1_LOG}"
+            S1_EXIT="${PIPESTATUS[0]}"
+          fi
+          (
+            cd "${ZONE03}"
+            rm -f evidence_manifest.sha256
+            find . -type f ! -name "evidence_manifest.sha256" | LC_ALL=C sort | sed 's#^\./##' | xargs sha256sum > evidence_manifest.sha256
+          )
+          set -e
+          echo "stage1_exit_code=${S1_EXIT}" >> "${GITHUB_OUTPUT}"
+
+      - name: "5B. Upload Stage 1 Checkpoint Artifact Immediately Before L7 Monolithic Fresh Replay"
+        if: always() && steps.preflight.outputs.preflight_passed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pneuma-external-replay-r0-stage1-checkpoint-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ steps.preflight.outputs.zone03 }}/**
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: "5C. Stage 2 — L7 Monolithic Fresh Leanchecker (~10.74 GB), Post-Immutability & Sentinels K1/K2"
+        id: stage2
+        if: steps.preflight.outputs.preflight_passed == 'true'
         shell: bash
         env:
           WORK_ROOT: ${{ steps.preflight.outputs.work_root }}
@@ -214,10 +328,10 @@ jobs:
           export HOME="${ORIG_HOME}"
           export ELAN_HOME="${ELAN_HOME_DIR}"
           export PATH="${FULL_PATH}"
-          ORCH_CONSOLE="${ZONE03}/logs/orchestrator_console.log"
+          S2_LOG="${ZONE03}/logs/stage2_console.log"
 
           if sudo -n unshare --net sudo -u "${USER}" env "HOME=${ORIG_HOME}" "ELAN_HOME=${ELAN_HOME_DIR}" "PATH=${FULL_PATH}" "${ELAN_BIN}/elan" which lean >/dev/null 2>&1; then
-            echo "Network Isolation Mode: KERNEL_NETNS_UNSHARE_OFFLINE" | tee "${ORCH_CONSOLE}"
+            echo "Network Isolation Mode (Stage 2): KERNEL_NETNS_UNSHARE_OFFLINE" | tee "${S2_LOG}"
             sudo -n unshare --net sudo -u "${USER}" env \
               "HOME=${ORIG_HOME}" \
               "USER=${USER}" \
@@ -238,37 +352,40 @@ jobs:
               "ImageOS=${ImageOS:-}" \
               "ImageVersion=${ImageVersion:-}" \
               "${PYTHON3_BIN}" -B "${ORCH_FILE}" \
+                --phase stage2 \
                 --bundle-zip "${BUNDLE_FILE}" \
                 --work-root "${WORK_ROOT}" \
                 --job-start-epoch "${JOB_START_EPOCH}" \
                 --expected-workflow-sha256 "${CLEAN_EXP_WF_SHA}" \
                 --executed-workflow-sha256 "${EXEC_WF_SHA}" \
                 --executed-workflow-bytes "${EXEC_WF_BYTES}" \
-                --elan-bin-dir "${ELAN_BIN}" 2>&1 | tee -a "${ORCH_CONSOLE}"
-            ORCH_EXIT="${PIPESTATUS[0]}"
+                --elan-bin-dir "${ELAN_BIN}" 2>&1 | tee -a "${S2_LOG}"
+            S2_EXIT="${PIPESTATUS[0]}"
           else
-            echo "Network Isolation Mode: STANDARD_EPHEMERAL_VM_NO_NET_CALLS" | tee "${ORCH_CONSOLE}"
+            echo "Network Isolation Mode (Stage 2): STANDARD_EPHEMERAL_VM_NO_NET_CALLS" | tee "${S2_LOG}"
             "${PYTHON3_BIN}" -B "${ORCH_FILE}" \
+              --phase stage2 \
               --bundle-zip "${BUNDLE_FILE}" \
               --work-root "${WORK_ROOT}" \
               --job-start-epoch "${JOB_START_EPOCH}" \
               --expected-workflow-sha256 "${CLEAN_EXP_WF_SHA}" \
               --executed-workflow-sha256 "${EXEC_WF_SHA}" \
               --executed-workflow-bytes "${EXEC_WF_BYTES}" \
-              --elan-bin-dir "${ELAN_BIN}" 2>&1 | tee -a "${ORCH_CONSOLE}"
-            ORCH_EXIT="${PIPESTATUS[0]}"
+              --elan-bin-dir "${ELAN_BIN}" 2>&1 | tee -a "${S2_LOG}"
+            S2_EXIT="${PIPESTATUS[0]}"
           fi
           set -e
-          echo "orchestrator_exit_code=${ORCH_EXIT}" >> "${GITHUB_OUTPUT}"
+          echo "stage2_exit_code=${S2_EXIT}" >> "${GITHUB_OUTPUT}"
 
-      - name: "6. Post-Run Repository Checkout Immutability Re-Check & Seal Evidence Manifest (Always)"
+      - name: "6. Post-Run Repository Checkout Immutability Re-Check & Seal Final Evidence Manifest (Always)"
         if: always()
         shell: bash
         env:
           ZONE03: ${{ steps.preflight.outputs.zone03 }}
           INPUT_BUNDLE_REL: ${{ inputs.bundle_zip_path }}
           INPUT_ORCH_REL: ${{ inputs.orchestrator_script_path }}
-          ORCH_EXIT: ${{ steps.replay.outputs.orchestrator_exit_code }}
+          S1_EXIT: ${{ steps.stage1.outputs.stage1_exit_code }}
+          S2_EXIT: ${{ steps.stage2.outputs.stage2_exit_code }}
           EXEC_WF_SHA: ${{ steps.preflight.outputs.exec_wf_sha }}
         run: |
           set -euo pipefail
@@ -304,12 +421,13 @@ jobs:
             find . -type f ! -name "evidence_manifest.sha256" | LC_ALL=C sort | sed 's#^\./##' | xargs sha256sum > evidence_manifest.sha256
           )
           echo "## PNEUMA External Replay R0 — Tier 1 Ubuntu 24.04 Summary" >> "${GITHUB_STEP_SUMMARY}"
-          echo "- **Orchestrator Exit Code**: \`${ORCH_EXIT:-PREFLIGHT_ABORTED}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Stage 1 Exit Code**: \`${S1_EXIT:-NOT_RUN}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- **Stage 2 Exit Code**: \`${S2_EXIT:-NOT_RUN}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Executed Workflow SHA-256**: \`${EXEC_WF_SHA:-UNKNOWN}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Canonical Bundle ZIP SHA-256**: \`${EXPECTED_BUNDLE_ZIP_SHA256}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "- **Git Commit / Run ID / Attempt**: \`${GITHUB_SHA}\` / \`${GITHUB_RUN_ID}\` / \`${GITHUB_RUN_ATTEMPT}\`" >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: "7. Upload Detached External Replay Evidence Bundle (Always)"
+      - name: "7. Upload Final Detached External Replay Evidence Bundle (Always)"
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -324,7 +442,8 @@ jobs:
         env:
           WORK_ROOT: ${{ steps.preflight.outputs.work_root }}
           PREFLIGHT_OK: ${{ steps.preflight.outputs.preflight_passed }}
-          ORCH_EXIT: ${{ steps.replay.outputs.orchestrator_exit_code }}
+          S1_EXIT: ${{ steps.stage1.outputs.stage1_exit_code }}
+          S2_EXIT: ${{ steps.stage2.outputs.stage2_exit_code }}
         run: |
           set -euo pipefail
           if [[ -n "${WORK_ROOT}" ]] && [[ -d "${WORK_ROOT}/01_ImmutableInputSnapshot" ]]; then
@@ -334,8 +453,8 @@ jobs:
             echo "Failing job because preflight gate did not pass."
             exit 1
           fi
-          if [[ "${ORCH_EXIT}" != "0" ]]; then
-            echo "Failing job because orchestrator exited with code ${ORCH_EXIT:-EMPTY}."
+          if [[ "${S1_EXIT}" != "0" ]] || [[ "${S2_EXIT}" != "0" ]]; then
+            echo "Failing job (Stage1=${S1_EXIT:-EMPTY}, Stage2=${S2_EXIT:-EMPTY})."
             exit 1
           fi
           echo "Tier 1 External Replay R0 completed with exit code 0."
